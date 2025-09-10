@@ -13,22 +13,29 @@ FRAME_MS = 70                  # ~14 FPS
 # Encoders (VCC=3V3, GND=GND)
 LEFT_CLK,  LEFT_DT  = 2, 3
 RIGHT_CLK, RIGHT_DT = 4, 5
-LEFT_DIR, RIGHT_DIR = -1, -1   # flip to +1 if needed
+LEFT_DIR, RIGHT_DIR = -1, -1   # pon +1 si quieres invertir sentido
+
+# Botones de los encoders (SW) -> activo en LOW
+LEFT_SW, RIGHT_SW = 6, 7
 
 PADDLE_H   = 4
 WIN_SCORE  = 3
 
-# --- Ball speed (CONSTANT magnitude) ---
-SPEED         = 0.33           # pixels per frame (set your desired constant speed)
-MIN_VX_FRAC   = 0.35           # keep at least 35% of SPEED horizontally
-MAX_VY_FRAC   = 0.85           # cap vertical component to 85% of SPEED
-SPIN_FRAC     = 0.25           # how much spin adds to vy (fraction of SPEED)
+# --- Velocidad de la pelota (magnitud CONSTANTE) ---
+SPEED         = 0.33
+MIN_VX_FRAC   = 0.35
+MAX_VY_FRAC   = 0.85
+SPIN_FRAC     = 0.25
 
-# Colors
+# Colores
 RED   = (255,  0,  0)
 BLUE  = (  0,  0,255)
 GOLD  = (255,215,  0)
-PH_G  = ( 80,160, 80)          # placeholder pips (light, dim green)
+PH_G  = ( 80,160, 80)          # puntos “marcadores” apagados (verde tenue)
+
+# --- Límites del campo (excluye fila de marcadores y=0) ---
+TOP_WALL = 1            # primera fila jugable
+BOT_WALL = H - 1        # última fila (15 en 16x16)
 
 # =========================
 # LED helpers (serpentine)
@@ -83,37 +90,37 @@ class RotaryIRQ:
 left_enc  = RotaryIRQ(LEFT_CLK,  LEFT_DT,  dir=LEFT_DIR,  min_ms=2)
 right_enc = RotaryIRQ(RIGHT_CLK, RIGHT_DT, dir=RIGHT_DIR, min_ms=2)
 
+# Botones (activo LOW)
+btnL = Pin(LEFT_SW,  Pin.IN, Pin.PULL_UP)
+btnR = Pin(RIGHT_SW, Pin.IN, Pin.PULL_UP)
+def button_pressed():
+    if not btnL.value() or not btnR.value():
+        time.sleep_ms(20)  # debounce
+        return (not btnL.value()) or (not btnR.value())
+    return False
+
 # =========================
-# Helpers for constant speed
+# Física / utilidades
 # =========================
 def clamp(v, lo, hi): 
     return lo if v < lo else hi if v > hi else v
 
 def enforce_speed(vx, vy):
-    """Normalize (vx,vy) to fixed SPEED, keep vx sign, cap vy, enforce min |vx|."""
     sgnx = 1 if vx >= 0 else -1
     sgny = 1 if vy >= 0 else -1
-
-    # cap vertical component first
+    # limitar componente vertical
     max_vy = SPEED * MAX_VY_FRAC
-    if abs(vy) > max_vy:
-        vy = sgny * max_vy
-
-    # normalize to SPEED
+    if abs(vy) > max_vy: vy = sgny * max_vy
+    # normalizar a SPEED
     mag = (vx*vx + vy*vy) ** 0.5
-    if mag == 0:
-        return sgnx * SPEED, 0.0
+    if mag == 0: return sgnx * SPEED, 0.0
     scale = SPEED / mag
-    vx *= scale
-    vy *= scale
-
-    # ensure minimum horizontal component
+    vx *= scale; vy *= scale
+    # asegurar componente horizontal mínima
     min_vx = SPEED * MIN_VX_FRAC
     if abs(vx) < min_vx:
         vx = sgnx * min_vx
-        # adjust vy to keep total speed exactly SPEED
         vy = (SPEED**2 - vx*vx) ** 0.5 * (1 if vy >= 0 else -1)
-
     return vx, vy
 
 def rand_sign(): return -1 if (urandom.getrandbits(1)) else 1
@@ -121,14 +128,13 @@ def rand_sign(): return -1 if (urandom.getrandbits(1)) else 1
 def reset_point(to_left_start=False):
     bx = (W-1)/2
     by = (H-1)/2
-    # start mostly horizontal with a small random vertical component
     vx = SPEED * (-1 if to_left_start else 1)
     vy = SPEED * 0.25 * rand_sign()
-    vx, vy = enforce_speed(vx, vy)          # <-- assign first
-    return bx, by, vx, vy                    # <-- then return
+    vx, vy = enforce_speed(vx, vy)
+    return bx, by, vx, vy
 
 # =========================
-# Game state
+# Estado del juego
 # =========================
 lp_y = float(H//2)
 rp_y = float(H//2)
@@ -139,13 +145,60 @@ SMOOTH = 0.6
 score_l = score_r = 0
 ball_fx, ball_fy, vx, vy = reset_point(to_left_start=False)
 
+STATE_READY     = 0
+STATE_PLAYING   = 1
+STATE_GAME_OVER = 2
+
+state = STATE_READY
+winner_color = None
+next_serve_to_left = False  # quién saca después (la pelota sale hacia la izquierda si True)
+
+def render_ready():
+    clear()
+    draw_paddle(0,     int(round(lp_y)), PADDLE_H, RED)
+    draw_paddle(W-1,   int(round(rp_y)), PADDLE_H, BLUE)
+    draw_ball(W//2, H//2, GOLD)   # pelota centrada, estática
+    draw_score(0, 0)
+    np.write()
+
 # =========================
-# Main loop
+# Bucle principal
 # =========================
 next_tick = time.ticks_add(time.ticks_ms(), FRAME_MS)
+gameover_t0 = None
 
 while True:
-    # --- paddles from encoders (smooth) ---
+    # ---------- READY: espera botón ----------
+    if state == STATE_READY:
+        lp_y = rp_y = float(H//2)
+        left_enc.pos = right_enc.pos = 0
+        lp_prev = rp_prev = 0
+        score_l = score_r = 0
+        render_ready()
+        while not button_pressed():
+            time.sleep_ms(30)
+        ball_fx, ball_fy, vx, vy = reset_point(to_left_start=next_serve_to_left)
+        state = STATE_PLAYING
+        next_tick = time.ticks_add(time.ticks_ms(), FRAME_MS)
+        continue
+
+    # ---------- GAME OVER: color del ganador; tras 10s pasa a READY ----------
+    if state == STATE_GAME_OVER:
+        np.fill(tuple(int(c*BRIGHTNESS) for c in winner_color)); np.write()
+        if gameover_t0 is None:
+            gameover_t0 = time.ticks_ms()
+        while True:
+            if button_pressed():
+                state = STATE_READY; gameover_t0 = None
+                break
+            if time.ticks_diff(time.ticks_ms(), gameover_t0) >= 10_000:
+                state = STATE_READY; gameover_t0 = None
+                break
+            time.sleep_ms(30)
+        continue
+
+    # ---------- PLAYING ----------
+    # palas (suavizado)
     lp_now = left_enc.read()
     rp_now = right_enc.read()
     lp_target = lp_y + (lp_now - lp_prev)
@@ -155,38 +208,41 @@ while True:
     lp_y = lp_y * SMOOTH + lp_target * (1.0 - SMOOTH)
     rp_y = rp_y * SMOOTH + rp_target * (1.0 - SMOOTH)
 
-    lo, hi = PADDLE_H/2, (H-1) - PADDLE_H/2
+    # límites de palas: respetar fila de marcadores y permitir llegar a la última
+    half = PADDLE_H // 2
+    edge_fix = 1 if (PADDLE_H % 2 == 0) else 0
+    lo = TOP_WALL + half                 # mínima cy para no invadir y=0
+    hi = (H - 1) - half + edge_fix       # tocar fondo incluso con altura par
     lp_y = clamp(lp_y, lo, hi)
     rp_y = clamp(rp_y, lo, hi)
 
-    # --- move ball ---
+    # mover pelota
     ball_fx += vx
     ball_fy += vy
 
-    # top/bottom bounce
-    if ball_fy < 0:
-        ball_fy = 0; vy = abs(vy)
-        vx, vy = enforce_speed(vx, vy)
-    elif ball_fy > H-1:
-        ball_fy = H-1; vy = -abs(vy)
-        vx, vy = enforce_speed(vx, vy)
+    # rebote arriba/abajo (la pelota NUNCA entra en y=0)
+    if ball_fy < TOP_WALL:
+        ball_fy = TOP_WALL
+        vy = abs(vy); vx, vy = enforce_speed(vx, vy)
+    elif ball_fy > BOT_WALL:
+        ball_fy = BOT_WALL
+        vy = -abs(vy); vx, vy = enforce_speed(vx, vy)
 
-    # left paddle (x=0)
+    # pala izquierda (x=0)
     if vx < 0 and ball_fx <= 0:
         if abs(ball_fy - lp_y) <= PADDLE_H/2:
-            ball_fx = 0; vx = abs(vx)      # reflect to the right
-            # add spin proportional to impact offset
-            off = (ball_fy - lp_y) / (PADDLE_H/2)   # -1..+1
+            ball_fx = 0; vx = abs(vx)
+            off = (ball_fy - lp_y) / (PADDLE_H/2)
             vy += off * (SPEED * SPIN_FRAC)
             vx, vy = enforce_speed(vx, vy)
         else:
             score_r += 1
             ball_fx, ball_fy, vx, vy = reset_point(to_left_start=False)
 
-    # right paddle (x=W-1)
+    # pala derecha (x=W-1)
     if vx > 0 and ball_fx >= W-1:
         if abs(ball_fy - rp_y) <= PADDLE_H/2:
-            ball_fx = W-1; vx = -abs(vx)   # reflect to the left
+            ball_fx = W-1; vx = -abs(vx)
             off = (ball_fy - rp_y) / (PADDLE_H/2)
             vy += off * (SPEED * SPIN_FRAC)
             vx, vy = enforce_speed(vx, vy)
@@ -194,7 +250,7 @@ while True:
             score_l += 1
             ball_fx, ball_fy, vx, vy = reset_point(to_left_start=True)
 
-    # --- draw (single write; no blinking) ---
+    # dibujar
     clear()
     draw_paddle(0,     int(round(lp_y)), PADDLE_H, RED)
     draw_paddle(W-1,   int(round(rp_y)), PADDLE_H, BLUE)
@@ -202,21 +258,16 @@ while True:
     draw_score(score_l, score_r)
     np.write()
 
-    # --- win condition (solid screen, no flashing) ---
+    # condición de victoria → GAME_OVER; el que perdió saca después
     if score_l >= WIN_SCORE or score_r >= WIN_SCORE:
-        winner = RED if score_l > score_r else BLUE
-        np.fill(tuple(int(c*BRIGHTNESS) for c in winner)); np.write()
-        time.sleep(2.0)
-        # restart
-        score_l = score_r = 0
-        lp_y = rp_y = float(H//2)
-        left_enc.pos = right_enc.pos = 0
-        lp_prev = rp_prev = 0
-        ball_fx, ball_fy, vx, vy = reset_point(to_left_start=(winner is BLUE))
+        winner_color = RED if score_l > score_r else BLUE
+        next_serve_to_left = (winner_color is BLUE)  # saca el perdedor
+        state = STATE_GAME_OVER
+        continue
 
-    # --- fixed timestep ---
+    # timestep fijo
     now = time.ticks_ms()
     sleep_ms = time.ticks_diff(next_tick, now)
     if sleep_ms > 0:
         time.sleep_ms(sleep_ms)
-    next_tick = time.ticks_add(next_tick, FRAME_MS)
+    next_tick = time.ticks_add(next_tick, FRAME_MS)
