@@ -1,4 +1,4 @@
-from machine import Pin
+from machine import Pin, PWM
 import neopixel, time, urandom
 
 # =========================
@@ -13,29 +13,60 @@ FRAME_MS = 70                  # ~14 FPS
 # Encoders (VCC=3V3, GND=GND)
 LEFT_CLK,  LEFT_DT  = 2, 3
 RIGHT_CLK, RIGHT_DT = 4, 5
-LEFT_DIR, RIGHT_DIR = -1, -1   # pon +1 si quieres invertir sentido
+LEFT_DIR, RIGHT_DIR = -1, -1   # put +1 to invert direction if needed
 
-# Botones de los encoders (SW) -> activo en LOW
+# Encoder push-buttons (SW pins) -> active LOW
 LEFT_SW, RIGHT_SW = 6, 7
+
+# Buzzer (TMB12A05). Use GPIO9. At 5 V use NPN driver; at 3V3 can be direct (quieter).
+BUZ_PIN = 9
+buz = PWM(Pin(BUZ_PIN), freq=2300)
+buz.duty_u16(0)  # off
+
+def tone(freq=2300, ms=120, duty=32000):
+    buz.freq(freq)
+    buz.duty_u16(duty)      # 0..65535
+    time.sleep_ms(ms)
+    buz.duty_u16(0)
+
+def miss_sound(left_side_missed: bool):
+    # small two-note pattern, different per side
+    if left_side_missed:
+        tone(2000, 120); time.sleep_ms(40); tone(1500, 160)   # lower
+    else:
+        tone(2600, 120); time.sleep_ms(40); tone(3100, 160)   # higher
+
+def win_sound(winner_is_red: bool):
+    """Play a short victory jingle."""
+    if winner_is_red:
+        # ascending “win”
+        for f, d in ((1800,120),(2100,120),(2400,160),(2900,220)):
+            tone(f, d)
+            time.sleep_ms(30)
+    else:
+        # descending “win”
+        for f, d in ((3200,120),(2800,120),(2400,160),(2000,220)):
+            tone(f, d)
+            time.sleep_ms(30)
 
 PADDLE_H   = 4
 WIN_SCORE  = 3
 
-# --- Velocidad de la pelota (magnitud CONSTANTE) ---
+# --- Ball speed (CONSTANT magnitude) ---
 SPEED         = 0.33
 MIN_VX_FRAC   = 0.35
 MAX_VY_FRAC   = 0.85
 SPIN_FRAC     = 0.25
 
-# Colores
+# Colors
 RED   = (255,  0,  0)
 BLUE  = (  0,  0,255)
 GOLD  = (255,215,  0)
-PH_G  = ( 80,160, 80)          # puntos “marcadores” apagados (verde tenue)
+PH_G  = ( 80,160, 80)          # placeholder pips (light, dim green)
 
-# --- Límites del campo (excluye fila de marcadores y=0) ---
-TOP_WALL = 1            # primera fila jugable
-BOT_WALL = H - 1        # última fila (15 en 16x16)
+# --- Playfield limits (exclude score row y=0) ---
+TOP_WALL = 1            # first playable row
+BOT_WALL = H - 1        # last playable row
 
 # =========================
 # LED helpers (serpentine)
@@ -90,7 +121,7 @@ class RotaryIRQ:
 left_enc  = RotaryIRQ(LEFT_CLK,  LEFT_DT,  dir=LEFT_DIR,  min_ms=2)
 right_enc = RotaryIRQ(RIGHT_CLK, RIGHT_DT, dir=RIGHT_DIR, min_ms=2)
 
-# Botones (activo LOW)
+# Buttons (active LOW)
 btnL = Pin(LEFT_SW,  Pin.IN, Pin.PULL_UP)
 btnR = Pin(RIGHT_SW, Pin.IN, Pin.PULL_UP)
 def button_pressed():
@@ -100,7 +131,7 @@ def button_pressed():
     return False
 
 # =========================
-# Física / utilidades
+# Physics helpers
 # =========================
 def clamp(v, lo, hi): 
     return lo if v < lo else hi if v > hi else v
@@ -108,15 +139,15 @@ def clamp(v, lo, hi):
 def enforce_speed(vx, vy):
     sgnx = 1 if vx >= 0 else -1
     sgny = 1 if vy >= 0 else -1
-    # limitar componente vertical
+    # cap vertical component
     max_vy = SPEED * MAX_VY_FRAC
     if abs(vy) > max_vy: vy = sgny * max_vy
-    # normalizar a SPEED
+    # normalize to SPEED
     mag = (vx*vx + vy*vy) ** 0.5
     if mag == 0: return sgnx * SPEED, 0.0
     scale = SPEED / mag
     vx *= scale; vy *= scale
-    # asegurar componente horizontal mínima
+    # ensure minimum horizontal
     min_vx = SPEED * MIN_VX_FRAC
     if abs(vx) < min_vx:
         vx = sgnx * min_vx
@@ -134,7 +165,7 @@ def reset_point(to_left_start=False):
     return bx, by, vx, vy
 
 # =========================
-# Estado del juego
+# Game state & rendering
 # =========================
 lp_y = float(H//2)
 rp_y = float(H//2)
@@ -151,24 +182,25 @@ STATE_GAME_OVER = 2
 
 state = STATE_READY
 winner_color = None
-next_serve_to_left = False  # quién saca después (la pelota sale hacia la izquierda si True)
+next_serve_to_left = False  # who serves next (ball heads left if True)
 
 def render_ready():
     clear()
     draw_paddle(0,     int(round(lp_y)), PADDLE_H, RED)
     draw_paddle(W-1,   int(round(rp_y)), PADDLE_H, BLUE)
-    draw_ball(W//2, H//2, GOLD)   # pelota centrada, estática
+    draw_ball(W//2, H//2, GOLD)   # centered, static
     draw_score(0, 0)
     np.write()
+    buz.duty_u16(0)  # ensure buzzer is silent
 
 # =========================
-# Bucle principal
+# Main loop
 # =========================
 next_tick = time.ticks_add(time.ticks_ms(), FRAME_MS)
 gameover_t0 = None
 
 while True:
-    # ---------- READY: espera botón ----------
+    # ---------- READY: wait for button ----------
     if state == STATE_READY:
         lp_y = rp_y = float(H//2)
         left_enc.pos = right_enc.pos = 0
@@ -182,7 +214,7 @@ while True:
         next_tick = time.ticks_add(time.ticks_ms(), FRAME_MS)
         continue
 
-    # ---------- GAME OVER: color del ganador; tras 10s pasa a READY ----------
+    # ---------- GAME OVER: winner color; after 10s go to READY ----------
     if state == STATE_GAME_OVER:
         np.fill(tuple(int(c*BRIGHTNESS) for c in winner_color)); np.write()
         if gameover_t0 is None:
@@ -198,7 +230,7 @@ while True:
         continue
 
     # ---------- PLAYING ----------
-    # palas (suavizado)
+    # paddles (smoothed)
     lp_now = left_enc.read()
     rp_now = right_enc.read()
     lp_target = lp_y + (lp_now - lp_prev)
@@ -208,19 +240,19 @@ while True:
     lp_y = lp_y * SMOOTH + lp_target * (1.0 - SMOOTH)
     rp_y = rp_y * SMOOTH + rp_target * (1.0 - SMOOTH)
 
-    # límites de palas: respetar fila de marcadores y permitir llegar a la última
+    # paddle limits: keep score row free and allow bottom row
     half = PADDLE_H // 2
     edge_fix = 1 if (PADDLE_H % 2 == 0) else 0
-    lo = TOP_WALL + half                 # mínima cy para no invadir y=0
-    hi = (H - 1) - half + edge_fix       # tocar fondo incluso con altura par
+    lo = TOP_WALL + half                 # min cy (score row y=0 is off-limits)
+    hi = (H - 1) - half + edge_fix       # can touch bottom even with even height
     lp_y = clamp(lp_y, lo, hi)
     rp_y = clamp(rp_y, lo, hi)
 
-    # mover pelota
+    # move ball
     ball_fx += vx
     ball_fy += vy
 
-    # rebote arriba/abajo (la pelota NUNCA entra en y=0)
+    # top/bottom bounce (ball never enters y=0)
     if ball_fy < TOP_WALL:
         ball_fy = TOP_WALL
         vy = abs(vy); vx, vy = enforce_speed(vx, vy)
@@ -228,7 +260,7 @@ while True:
         ball_fy = BOT_WALL
         vy = -abs(vy); vx, vy = enforce_speed(vx, vy)
 
-    # pala izquierda (x=0)
+    # left paddle (x=0)
     if vx < 0 and ball_fx <= 0:
         if abs(ball_fy - lp_y) <= PADDLE_H/2:
             ball_fx = 0; vx = abs(vx)
@@ -237,9 +269,10 @@ while True:
             vx, vy = enforce_speed(vx, vy)
         else:
             score_r += 1
+            miss_sound(left_side_missed=True)     # buzzer on miss
             ball_fx, ball_fy, vx, vy = reset_point(to_left_start=False)
 
-    # pala derecha (x=W-1)
+    # right paddle (x=W-1)
     if vx > 0 and ball_fx >= W-1:
         if abs(ball_fy - rp_y) <= PADDLE_H/2:
             ball_fx = W-1; vx = -abs(vx)
@@ -248,9 +281,10 @@ while True:
             vx, vy = enforce_speed(vx, vy)
         else:
             score_l += 1
+            miss_sound(left_side_missed=False)    # buzzer on miss
             ball_fx, ball_fy, vx, vy = reset_point(to_left_start=True)
 
-    # dibujar
+    # draw
     clear()
     draw_paddle(0,     int(round(lp_y)), PADDLE_H, RED)
     draw_paddle(W-1,   int(round(rp_y)), PADDLE_H, BLUE)
@@ -258,16 +292,18 @@ while True:
     draw_score(score_l, score_r)
     np.write()
 
-    # condición de victoria → GAME_OVER; el que perdió saca después
+    # win condition → play WIN sound → GAME_OVER; loser serves next
     if score_l >= WIN_SCORE or score_r >= WIN_SCORE:
-        winner_color = RED if score_l > score_r else BLUE
-        next_serve_to_left = (winner_color is BLUE)  # saca el perdedor
+        winner_is_red = (score_l > score_r)
+        win_sound(winner_is_red)  # <-- play victory jingle once
+        winner_color = RED if winner_is_red else BLUE
+        next_serve_to_left = (winner_color is BLUE)  # loser serves
         state = STATE_GAME_OVER
         continue
 
-    # timestep fijo
+    # fixed timestep
     now = time.ticks_ms()
     sleep_ms = time.ticks_diff(next_tick, now)
     if sleep_ms > 0:
         time.sleep_ms(sleep_ms)
-    next_tick = time.ticks_add(next_tick, FRAME_MS)
+    next_tick = time.ticks_add(next_tick, FRAME_MS)
